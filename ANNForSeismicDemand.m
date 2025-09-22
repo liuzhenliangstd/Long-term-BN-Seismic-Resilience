@@ -102,8 +102,8 @@ function [bestModel, bestH] = trainANN(X, Y)
     % Input:  X (N×features), Y (N×outputs)
     % Output: bestModel (trained ANN), bestH (best hidden neurons)
     
-    hiddenCandidates = 20:2:100;
-    K = 5; % K-fold
+    hiddenCandidates = 20:1:100;
+    K = 10; % K-fold
     cvPart = cvpartition(size(X,1), 'KFold', K);
 
     bestMSE = inf;
@@ -120,7 +120,7 @@ function [bestModel, bestH] = trainANN(X, Y)
 
             % Create ANN
             net = feedforwardnet(h, 'trainlm');
-            net.trainParam.epochs = 10;
+            net.trainParam.epochs = 1000;
             net.trainParam.goal = 1e-3;
             net.divideParam.trainRatio = 1.0;
             net.divideParam.valRatio   = 0.0;
