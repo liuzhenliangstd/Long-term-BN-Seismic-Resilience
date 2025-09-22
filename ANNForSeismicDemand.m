@@ -1,172 +1,194 @@
-%% train_ANN_BridgeSeismicDemand.m
-%  Data-driven seismic demand model for bridge networks
+% Main script for ANN vs XGBoost comparison
 clear; clc; close all;
 
-%% 0. Parameters
-K               = 10;                 % K-fold CV
-testRatio       = 0.20;               % 20 % hold-out for final test
-hidLayerRange   = 1:4;                % no. of hidden layers
-neuronsRange    = 20:100;          % neurons per hidden layer
-learnRateRange  = [1e-3 3e-3 1e-2];   % learning rates
-l2Range         = [0 1e-4 1e-3];      % L2 regularisation factors
-maxEpochs       = 1e4;
-patience        = 200;                % early-stopping patience
-
 %% 1. Load data
-load MLtestdata.mat   %# contains inputfeature (N×31) and outputproperty (N×6)
-X = inputfeature;     Y = outputproperty;
-N = size(X,1);
+load('DataForApplCheck.mat'); % Assume X (N×31), Y (N×6)
+X=DataForApplCheck.input;
+Y=log(DataForApplCheck.output);
+[N, nFeat] = size(X);
+fprintf('Dataset loaded: %d samples, %d features.\n', N, nFeat);
 
-% shuffle data
-rng default
-idx = randperm(N);
-X = X(idx,:); Y = Y(idx,:);
+%% 2. Train/Test split
+rng(42); % reproducibility
+cv = cvpartition(N, 'HoldOut', 0.2);
+Xtrain = X(training(cv), :);
+Ytrain = Y(training(cv), :);
+Xtest  = X(test(cv), :);
+Ytest  = Y(test(cv), :);
 
-%% 2. Train/test split
-Ntest        = round(testRatio*N);
-Xtest        = X(1:Ntest,:);   Ytest = Y(1:Ntest,:);
-XtrainAll    = X(Ntest+1:end,:); YtrainAll = Y(Ntest+1:end,:);
+%% 3. Normalization
+[xtrain, xPS] = mapminmax(Xtrain', 0, 1); xtrain = xtrain';
+[xtest, ~]    = mapminmax('apply', Xtest', xPS); xtest = xtest';
 
-%% 3. Grid-search K-fold CV
-bestMSE  = inf;   bestNet = [];
-bestInfo = struct();
+[ytrain, yPS] = mapminmax(Ytrain', 0, 1); ytrain = ytrain';
+[ytest, ~]    = mapminmax('apply', Ytest', yPS); ytest = ytest';
 
-cv = cvpartition(size(XtrainAll,1),'KFold',K);
+%% 4. Train ANN model
+fprintf('--- Training ANN ---\n');
+tic;
+annModel = trainANN(xtrain, ytrain);
+annTrainTime = toc;
 
-for nHidden = hidLayerRange
-    for nNeuron = neuronsRange
-        for lr = learnRateRange
-            for l2 = l2Range
-                
-                mseFold = zeros(K,1);
-                
-                for k = 1:K
-                    trainIdx = cv.training(k);  valIdx = cv.test(k);
-                    Xt = XtrainAll(trainIdx,:);    Yt = YtrainAll(trainIdx,:);
-                    Xv = XtrainAll(valIdx,:);      Yv = YtrainAll(valIdx,:);
-                    
-                    % Build network
-                    layers = [ ...
-                        featureInputLayer(size(X,2),'Normalization','zscore')
-                        fullyConnectedLayer(nNeuron,'L2Factor',l2) ...
-                        reluLayer];
-                    for h = 2:nHidden
-                        layers = [layers ...
-                            fullyConnectedLayer(nNeuron,'L2Factor',l2) ...
-                            reluLayer]; %#ok<AGROW>
-                    end
-                    layers = [layers ...
-                        fullyConnectedLayer(size(Y,2)) ...
-                        regressionLayer];
-                    
-                    options = trainingOptions('adam', ...
-                        'InitialLearnRate',lr, ...
-                        'MaxEpochs',maxEpochs, ...
-                        'MiniBatchSize',128, ...
-                        'Shuffle','every-epoch', ...
-                        'Verbose',false, ...
-                        'Plots','none', ...
-                        'ValidationData',{Xv,Yv}, ...
-                        'ValidationPatience',patience);
-                    
-                    net = trainNetwork(Xt,Yt,layers,options);
-                    Ypred = predict(net,Xv);
-                    mseFold(k) = mean((Ypred - Yv).^2,'all');
-                end
-                
-                cvMSE = mean(mseFold);
-                if cvMSE < bestMSE
-                    bestMSE  = cvMSE;
-                    bestNet  = net;
-                    bestInfo = struct('nHidden',nHidden,'nNeuron',nNeuron, ...
-                                      'lr',lr,'l2',l2,'cvMSE',cvMSE);
-                end
-            end
+%% ANN inference
+tic;
+Ypred_ann = annModel(xtest')'; % output normalized
+annInferTime = toc / size(xtest,1);
+
+% Reverse normalization
+Ypred_ann_real = mapminmax('reverse', Ypred_ann', yPS)'; 
+
+%% 5. Train ANN with automatic hidden-neuron search + K-fold CV
+fprintf('--- Training ANN with CV Search ---\n');
+tic;
+[annModel, bestH] = trainANN(xtrain, ytrain);
+annTrainTime = toc;
+
+tic;
+Ypred_ann = annModel(xtest')'; % normalized
+annInferTime = toc / size(xtest,1);
+Ypred_ann_real = mapminmax('reverse', Ypred_ann', yPS)'; 
+
+
+%% XGBoost inference
+%% ================== XGBoost 训练 ==================
+tic;
+xgbModel = trainXGB(xtrain, ytrain);
+xgbTrainTime = toc;
+
+tic;
+Ypred_xgb = zeros(size(ytest));
+for j = 1:size(Ytest,2)
+    Ypred_xgb(:,j) = predict(xgbModel{j}, xtest);
+end
+xgbInferTime = toc/size(xtest,1);
+
+% 反标准化
+Ypred_xgb_real = mapminmax('reverse',Ypred_xgb', yPS)'; 
+%% 6. Performance comparison
+mse_ann = mean((Ytest - Ypred_ann_real).^2, 'all');
+r2_ann  = 1 - sum((Ytest - Ypred_ann_real).^2, 'all')/sum((Ytest - mean(Ytest)).^2, 'all');
+
+mse_xgb = mean((Ytest - Ypred_xgb_real).^2, 'all');
+r2_xgb  = 1 - sum((Ytest - Ypred_xgb_real).^2, 'all')/sum((Ytest - mean(Ytest)).^2, 'all');
+
+fprintf('\n--- Runtime & Accuracy Comparison ---\n');
+fprintf('Model     | Train Time (s) | Inference Time (s/sample) | MSE      | R^2\n');
+fprintf('ANN       | %.3f           | %.6f                     | %.4f   | %.4f\n', ...
+        annTrainTime, annInferTime, mse_ann, r2_ann);
+fprintf('XGBoost   | %.3f           | %.6f                     | %.4f   | %.4f\n', ...
+        xgbTrainTime, xgbInferTime, mse_xgb, r2_xgb);
+
+%% Plot comparison for one output (e.g., first seismic demand)
+%% 结果展示：2x3 子图散点对比六个输出
+figure;
+for i = 1:6
+    subplot(2,3,i);
+    scatter(exp(Ytest(:,i)), exp(Ypred_ann_real(:,i)), 40, 'r', 'filled','DisplayName','ANN Pred'); hold on;
+    scatter(exp(Ytest(:,i)), exp(Ypred_xgb_real(:,i)), 40, 'b', 'filled','DisplayName','XGBoost Pred');
+    plot([min(exp(Ytest(:,i))), max(exp(Ytest(:,i)))], [min(exp(Ytest(:,i))), max(exp(Ytest(:,i)))], 'k--','LineWidth',1.5,'DisplayName','y=x');
+    xlabel('True Value');
+    ylabel(sprintf('Predicted Output %d',i));
+    title(sprintf('Scatter Comparison - Output %d',i));
+    legend('Location','best');
+    grid on;
+end
+sgtitle('Scatter Plots: ANN vs XGBoost Prediction Results (All 6 Outputs)');
+
+
+%% --- Functions ---
+
+function [bestModel, bestH] = trainANN(X, Y)
+    % trainANN - Search best hidden neurons (20~100) with K-fold CV
+    % Input:  X (N×features), Y (N×outputs)
+    % Output: bestModel (trained ANN), bestH (best hidden neurons)
+    
+    hiddenCandidates = 20:2:100;
+    K = 5; % K-fold
+    cvPart = cvpartition(size(X,1), 'KFold', K);
+
+    bestMSE = inf;
+    bestH = 0;
+    meanMSEs = zeros(length(hiddenCandidates),1);
+
+    for i = 1:length(hiddenCandidates)
+        h = hiddenCandidates(i);
+        mseFolds = zeros(K,1);
+
+        for k = 1:K
+            idxTrain = training(cvPart,k);
+            idxVal   = test(cvPart,k);
+
+            % Create ANN
+            net = feedforwardnet(h, 'trainlm');
+            net.trainParam.epochs = 10;
+            net.trainParam.goal = 1e-3;
+            net.divideParam.trainRatio = 1.0;
+            net.divideParam.valRatio   = 0.0;
+            net.divideParam.testRatio  = 0.0;
+
+            % Train on training fold
+            net = train(net, X(idxTrain,:)', Y(idxTrain,:)');
+            Yval_pred = net(X(idxVal,:)')';
+            
+            % Fold MSE
+            mseFolds(k) = mean((Y(idxVal,:) - Yval_pred).^2, 'all');
         end
+
+        meanMSE = mean(mseFolds);
+        meanMSEs(i) = meanMSE;
+
+        fprintf('Hidden %d -> CV-MSE = %.4f\n', h, meanMSE);
+
+        if meanMSE < bestMSE
+            bestMSE = meanMSE;
+            bestH = h;
+        end
+    end
+
+    fprintf('Best hidden neurons = %d (CV-MSE=%.4f)\n', bestH, bestMSE);
+
+    % Retrain best model on all data
+    bestModel = feedforwardnet(bestH, 'trainlm');
+    bestModel.trainParam.epochs = net.trainParam.epochs;
+    bestModel.trainParam.goal = 1e-3;
+    bestModel = train(bestModel, X', Y');
+
+    % ---- 绘制隐含层数 vs CV-MSE 曲线 ----
+    figure;
+    plot(hiddenCandidates, meanMSEs, '-o','LineWidth',1.5);
+    xlabel('Hidden neurons');
+    ylabel('Mean CV-MSE');
+    title('K-fold CV performance for different hidden neurons');
+    grid on;
+end
+
+
+function Ypred = predictXGBmulti(model, Xtest)
+    nOut = numel(model.submodels);
+    N = size(Xtest,1);
+    Ypred = zeros(N,nOut);
+    for j = 1:nOut
+        Ypred(:,j) = predict(model.submodels{j}, Xtest);
     end
 end
 
-fprintf('Best architecture: %d hidden layer(s) × %d neurons, LR=%.4f, L2=%.0e (CV-MSE=%.4f)\n', ...
-         bestInfo.nHidden,bestInfo.nNeuron,bestInfo.lr,bestInfo.l2,bestInfo.cvMSE);
+function model = trainXGB(Xtrain, Ytrain)
+    % trainXGB - 使用梯度提升树 (作为XGBoost替代) 训练回归模型
+    % Input:  Xtrain (N×features), Ytrain (N×outputs)
+    % Output: model (cell array，每个输出一个回归模型)
 
-%% 4. Retrain on full training set with best hyper-params
-% Build final net with best hyper-parameters
-layers = [ ...
-    featureInputLayer(size(X,2),'Normalization','zscore')
-    fullyConnectedLayer(bestInfo.nNeuron,'L2Factor',bestInfo.l2) reluLayer];
+    nOutputs = size(Ytrain,2);
+    model = cell(1, nOutputs);
 
-for h = 2:bestInfo.nHidden
-    layers = [layers ...
-        fullyConnectedLayer(bestInfo.nNeuron,'L2Factor',bestInfo.l2) reluLayer];
+    for j = 1:nOutputs
+        % 每个输出单独建模
+        model{j} = fitrensemble(Xtrain, Ytrain(:,j), ...
+            'Method','LSBoost', ...   % 梯度提升
+            'NumLearningCycles', 300, ... % 树数
+            'Learners', templateTree('MaxNumSplits', 30), ...
+            'LearnRate', 0.1);
+    end
 end
 
-layers = [layers fullyConnectedLayer(size(Y,2)) regressionLayer];
-
-options = trainingOptions('adam', ...
-    'InitialLearnRate',bestInfo.lr, ...
-    'MaxEpochs',maxEpochs, ...
-    'MiniBatchSize',128, ...
-    'Shuffle','every-epoch', ...
-    'Verbose',false);
-
-bestNet = trainNetwork(XtrainAll,YtrainAll,layers,options);
-
-%% 5. Test performance
-YtrainPred = predict(bestNet,XtrainAll);
-YtestPred  = predict(bestNet,Xtest);
-
-trainMSE = mean((YtrainPred-YtrainAll).^2,'all');
-testMSE  = mean((YtestPred - Ytest).^2,'all');
-trainR2  = 1 - sum((YtrainPred-YtrainAll).^2,'all') / sum((YtrainAll-mean(YtrainAll,'all')).^2,'all');
-testR2   = 1 - sum((YtestPred - Ytest).^2,'all') / sum((Ytest-mean(Ytest,'all')).^2,'all');
-
-fprintf('Train MSE: %.4f, R2: %.3f | Test MSE: %.4f, R2: %.3f\n', ...
-        trainMSE,trainR2,testMSE,testR2);
-
-%% 6.1  Predicted-vs-Actual plots for all outputs (3×2 subplots)
-outputNames = {'y1  CurvDuct','y2  BearDisp','y3  AbutDisp', ...
-               'y4  GirderDrift','y5  DeckAcc','y6  FoundMoment'};
-
-figure('Name','Predicted vs Actual (Train & Test)','Position',[100 100 1200 800]);
-
-for k = 1:6
-    subplot(3,2,k); hold on; box on; grid on;
-    
-    % Train and test scatter
-    scatter(YtrainAll(:,k),YtrainPred(:,k),10,'b','filled','MarkerFaceAlpha',0.4);
-    scatter(Ytest(:,k),    YtestPred(:,k), 10,'r','filled','MarkerFaceAlpha',0.6);
-    
-    % 1:1 reference line
-    ax = gca;
-    lims = [min(ax.XLim(1),ax.YLim(1)) max(ax.XLim(2),ax.YLim(2))];
-    plot(lims,lims,'k--','LineWidth',1);
-    axis equal; xlim(lims); ylim(lims);
-    
-    xlabel('Actual'); ylabel('Predicted');
-    title(['Output ',num2str(k),': ',outputNames{k}]);
-    
-    % Compute metrics for current output
-    mseTrain_k = mean((YtrainPred(:,k) - YtrainAll(:,k)).^2);
-    mseTest_k  = mean((YtestPred(:,k)  - Ytest(:,k)).^2);
-    r2Train_k  = 1 - sum((YtrainPred(:,k)-YtrainAll(:,k)).^2) / ...
-                       sum((YtrainAll(:,k)-mean(YtrainAll(:,k))).^2);
-    r2Test_k   = 1 - sum((YtestPred(:,k)-Ytest(:,k)).^2) / ...
-                       sum((Ytest(:,k)-mean(Ytest(:,k))).^2);
-    
-    % Annotation textbox
-    text(0.05,0.95, ...
-        {sprintf('Train  MSE = %.3g',mseTrain_k), ...
-         sprintf('Train  R^2 = %.3f',r2Train_k), ...
-         sprintf('Test   MSE = %.3g',mseTest_k), ...
-         sprintf('Test   R^2 = %.3f',r2Test_k)}, ...
-        'Units','normalized','FontSize',8,'VerticalAlignment','top', ...
-        'BackgroundColor','w','EdgeColor','k','Margin',2);
-    
-    legend({'Train','Test','1:1'},'Location','southeast','FontSize',8);
-end
-sgtitle('Predicted vs. Actual Responses for All Outputs');
 
 
-%% 7. Save trained model
-save('BestANN.mat','bestNet','bestInfo','trainMSE','testMSE','trainR2','testR2');
-disp('Best ANN model saved to BestANN.mat');
